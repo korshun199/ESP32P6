@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+
+# Диагностика платы и одобренная запись проверенной сборки ESP32-P4.
+# Запуск прошивки: bash ./run flash. Перед записью скрипт проверяет чип и
+# размер Flash, сохраняет полный дамп, записывает три образа и проверяет их.
+
+set -Eeuo pipefail
+
+# Определяет корень проекта независимо от текущего каталога запуска.
+PROJECT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+OUT_FILE="$PROJECT_DIR/out.txt"
+
+# Записывает весь вывод скрипта в файл и одновременно показывает его на экране.
+exec > >(tee "$OUT_FILE") 2>&1
+
+ESPTOOL="/home/oleg/.espressif/python_env/idf6.2_py3.12_env/bin/esptool"
+IDF_PYTHON="/home/oleg/.espressif/python_env/idf6.2_py3.12_env/bin/python"
+PORT="/dev/ttyACM0"
+
+if [[ "${1:-}" == "monitor" ]]; then
+    if [[ ! -c "$PORT" ]]; then
+        printf '\033[1;31mНе найден последовательный порт %s\033[0m\n' "$PORT"
+        exit 1
+    fi
+    printf '\033[1;36m=== UART-монитор ESP32-P4 ===\033[0m\n'
+    printf '\033[1;33mМонитор сам сбросит ESP32-P4 через RTS. BOOT не трогай. Для завершения нажми Ctrl+].\033[0m\n'
+    sudo "$IDF_PYTHON" -m esp_idf_monitor \
+        --port "$PORT" --baud 115200 --target esp32p4 \
+        --open-port-attempts 0 "$PROJECT_DIR/build/esp32p6_hello.elf"
+    printf '\033[1;32mЧтение UART завершено; полный лог сохранён в out.txt.\033[0m\n'
+    exit 0
+fi
+
+if [[ "${1:-}" == "flash" ]]; then
+    printf '\033[1;36m=== Подготовка одобренной прошивки ESP32-P4 ===\033[0m\n'
+
+    for required_file in \
+        "$PROJECT_DIR/build/bootloader/bootloader.bin" \
+        "$PROJECT_DIR/build/partition_table/partition-table.bin" \
+        "$PROJECT_DIR/build/esp32p6_hello.bin"; do
+        if [[ ! -s "$required_file" ]]; then
+            printf '\033[1;31mНет собранного файла: %s\033[0m\n' "$required_file"
+            exit 1
+        fi
+    done
+
+    if [[ ! -c "$PORT" ]]; then
+        printf '\033[1;31mНе найден последовательный порт %s\033[0m\n' "$PORT"
+        exit 1
+    fi
+
+    printf '\033[1;36m=== Проверка целевого чипа ===\033[0m\n'
+    CHIP_INFO="$(sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" chip-id 2>&1)"
+    printf '%s\n' "$CHIP_INFO"
+    if ! grep -q 'ESP32-P4' <<<"$CHIP_INFO"; then
+        printf '\033[1;31mПодключённый чип не распознан как ESP32-P4; запись отменена.\033[0m\n'
+        exit 1
+    fi
+
+    printf '\033[1;36m=== Проверка размера Flash ===\033[0m\n'
+    FLASH_INFO="$(sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" flash-id 2>&1)"
+    printf '%s\n' "$FLASH_INFO"
+    if ! grep -q 'Detected flash size: 16MB' <<<"$FLASH_INFO"; then
+        printf '\033[1;31mСборка настроена на 16 МБ; измеренный размер не совпал. Запись отменена.\033[0m\n'
+        exit 1
+    fi
+
+    BACKUP_DIR="$PROJECT_DIR/device_backups"
+    mkdir -p "$BACKUP_DIR"
+    FREE_KB="$(df -Pk "$BACKUP_DIR" | awk 'NR == 2 {print $4}')"
+    if [[ -z "$FREE_KB" ]] || [[ "$FREE_KB" -lt 35000 ]]; then
+        printf '\033[1;31mНедостаточно свободного места для полного дампа Flash; запись отменена.\033[0m\n'
+        exit 1
+    fi
+    BACKUP_FILE="$BACKUP_DIR/flash-16MB-$(date +%Y%m%d-%H%M%S-%N).bin"
+    touch "$BACKUP_FILE"
+    printf '\033[1;36m=== Резервная копия Flash 16 МБ: %s ===\033[0m\n' "$BACKUP_FILE"
+    sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" --baud 460800 \
+        read-flash --flash-size 16MB 0 0x1000000 "$BACKUP_FILE"
+    if [[ ! -s "$BACKUP_FILE" ]] || [[ "$(stat -c %s "$BACKUP_FILE")" -ne 16777216 ]]; then
+        printf '\033[1;31mДамп Flash неполный; прошивка отменена.\033[0m\n'
+        exit 1
+    fi
+    sha256sum "$BACKUP_FILE"
+
+    printf '\033[1;33m=== Запись bootloader, partition table и приложения ===\033[0m\n'
+    cd "$PROJECT_DIR"
+    sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" --baud 460800 \
+        write-flash --flash-mode dio --flash-freq 40m --flash-size 16MB \
+        0x2000 build/bootloader/bootloader.bin \
+        0x8000 build/partition_table/partition-table.bin \
+        0x10000 build/esp32p6_hello.bin
+
+    printf '\033[1;36m=== Проверка записанных образов ===\033[0m\n'
+    sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" --baud 460800 \
+        verify-flash --flash-size 16MB \
+        0x2000 build/bootloader/bootloader.bin \
+        0x8000 build/partition_table/partition-table.bin \
+        0x10000 build/esp32p6_hello.bin
+
+    printf '\033[1;32mFlash записан и проверен. Резервная копия: %s\033[0m\n' "$BACKUP_FILE"
+    printf '\033[1;33mПроверка загрузки и картинки на экране потребует чтения UART и осмотра дисплея.\033[0m\n'
+    exit 0
+fi
+
+printf '\033[1;36m=== Запуск диагностики: %s ===\033[0m\n' "$(date --iso-8601=seconds)"
+
+printf '\033[1;36m=== USB-устройства ===\033[0m\n'
+sudo lsusb
+
+printf '\n\033[1;36m=== Дерево USB ===\033[0m\n'
+sudo lsusb -t
+
+printf '\n\033[1;36m=== Последовательные устройства ===\033[0m\n'
+sudo find /dev -maxdepth 1 \
+    \( -name 'ttyACM*' -o -name 'ttyUSB*' -o -name 'ttyS*' \) \
+    -printf '%p %u:%g\n' | sort
+
+printf '\n\033[1;36m=== Идентификация ESP32-P4 без записи Flash ===\033[0m\n'
+sudo "$ESPTOOL" --chip esp32p4 --port "$PORT" chip-id || true
+
+printf '\n\033[1;36m=== Сообщения ядра ===\033[0m\n'
+sudo dmesg --time-format=iso | tail -80
+
+printf '\n\033[1;33mДиагностика завершена. Режимы: bash ./run monitor, bash ./run flash.\033[0m\n'

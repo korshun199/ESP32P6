@@ -1,0 +1,18 @@
+# Целевой микроконтроллер проекта.
+CONFIG_IDF_TARGET="esp32p4"
+
+# Поддержка ранней ревизии ESP32-P4, определённой как v1.3.
+CONFIG_ESP32P4_SELECTS_REV_LESS_V3=y
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_360=y
+
+# Размер Flash для модуля JC-ESP32P4-M3; run остановится, если замер платы иной.
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+
+# Экран 480x800 требует framebuffer 768 КБ; плата оснащена 32 МБ PSRAM.
+# Режим и частота соответствуют примеру MIPI-DSI для ESP32-P4 в этом ESP-IDF.
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_HEX=y
+CONFIG_SPIRAM_SPEED_200M=y
+
+# Логи выводятся через USB Serial/JTAG или выбранный ESP-IDF консольный порт.
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
